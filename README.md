@@ -4,7 +4,7 @@ Este é um script robusto em **Bash** desenvolvido para fins de auditoria de seg
 
 O script permite que administradores de rede e profissionais de segurança (Red/Blue Team) varram uma sub-rede específica. Para cada host ativo, ele executa uma sequência de conexões (o "knock") em portas predefinidas e, em seguida, verifica se uma porta alvo (padrão 1337) foi aberta como resultado, indicando um serviço que usa Port Knocking para acesso.
 
-## ⚙️ Requisitos
+## Requisitos
 
 Para garantir a funcionalidade ideal, recomenda-se a instalação das seguintes ferramentas:
 
