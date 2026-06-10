@@ -1,140 +1,256 @@
-#!/bin/bash
-# script-detector-input.sh
-# Script para deteccao de servicos ativados por port knocking, com input do usuario.
+#!/usr/bin/env bash
+# knockscan - Port knock service detector
+# Usage: ./knockscan.sh -t 192.168.1 -k 1337,80,443 -p 22
 
-## CONFIGURAÇÕES FIXAS
-# Porta alvo que deve abrir apos o knock
-TARGET_PORT="1337"
-# Timeout (em segundos) para a conexao
-TIMEOUT_SEC=1
+set -euo pipefail
 
-# DECLARAÇÃO DE VARIÁVEIS DE INPUT (serão preenchidas pelas funções)
-SUBNET=""
-KNOCK_PORTS=()
+# ── Colors ────────────────────────────────────────────────────────
+R="\e[0m"; BOLD="\e[1m"
+RD="\e[91m"; GR="\e[92m"; YL="\e[93m"; DG="\e[90m"
 
-## FUNÇÃO DE LOG
-function log_message() {
-    echo "[$(date +'%H:%M:%S')] $1"
+# ── Defaults ──────────────────────────────────────────────────────
+TARGET=""          # Single IP or subnet prefix (e.g. 192.168.1 or 192.168.1.5)
+KNOCK_PORTS=""     # Comma-separated knock sequence
+TARGET_PORT=""     # Port to check after knocking
+KNOCK_DELAY=100    # Delay between each knock in ms (default: 100ms)
+OPEN_DELAY=2       # Seconds to wait after knock sequence before checking port
+TIMEOUT=1          # Connection timeout in seconds
+THREADS=20         # Max parallel hosts (subnet mode only)
+OUTPUT=""          # Output file
+SILENT=false       # Suppress per-host noise, show only findings
+
+# ================================================================
+#  HELP
+# ================================================================
+
+usage() {
+cat << HELP
+${BOLD}Usage:${R}
+  $0 -t <target> -k <knock_ports> -p <target_port> [options]
+
+${BOLD}Options:${R}
+  -t, --target        Single IP or subnet prefix (required)
+                      Single:  192.168.1.10
+                      Subnet:  192.168.1  (scans .1 to .254)
+  -k, --knock         Knock sequence, comma-separated (required)
+                      e.g. 1337,80,443,8080
+  -p, --port          Target port to check after knock (required)
+  -d, --knock-delay   Delay between knocks in ms (default: 100)
+  -w, --wait          Seconds to wait after knock before checking (default: 2)
+  -T, --timeout       Connection timeout in seconds (default: 1)
+  -t2, --threads      Parallel hosts in subnet mode (default: 20)
+  -o, --output        Save findings to file
+  --silent            Show findings only, suppress per-host logs
+  -h, --help          Show this help
+
+${BOLD}Examples:${R}
+  # Test a single host
+  $0 -t 192.168.1.10 -k 1337,80,443 -p 22
+
+  # Scan a full /24 subnet
+  $0 -t 192.168.1 -k 1337,80,443 -p 22
+
+  # Custom timing, save results
+  $0 -t 10.0.0 -k 500,1000,2000 -p 4444 -d 200 -w 3 -o findings.txt
+
+  # Silent mode (findings only)
+  $0 -t 192.168.1 -k 1337,80,443 -p 22 --silent
+HELP
+exit 0
 }
 
-## FUNÇÃO PARA CAPTURAR A REDE
-function get_network_input() {
-    echo ""
-    read -p "Digite o prefixo da rede a varrer (e.g., 192.168.1): " SUBNET_INPUT
-    
-    # Validação básica
-    if [[ -z "$SUBNET_INPUT" ]]; then
-        log_message " Prefixo da rede não pode ser vazio. Saindo."
-        exit 1
-    fi
-    
-    # Atribui o valor validado à variável global
-    SUBNET=$SUBNET_INPUT
+# ================================================================
+#  CORE FUNCTIONS
+# ================================================================
+
+log() {
+    local level="$1" msg="$2"
+    local ts; ts=$(date +'%H:%M:%S')
+    case "$level" in
+        info)  $SILENT || printf "${DG}[%s]${R} %s\n" "$ts" "$msg" ;;
+        ok)    printf "${BOLD}${GR}[%s][+]${R} %s\n" "$ts" "$msg" ;;
+        warn)  $SILENT || printf "${YL}[%s][!]${R} %s\n" "$ts" "$msg" ;;
+        error) printf "${RD}[%s][-]${R} %s\n" "$ts" "$msg" ;;
+    esac
 }
 
-## 🚪 FUNÇÃO PARA CAPTURAR AS PORTAS DE KNOCK
-function get_knock_ports_input() {
-    read -p " Digite a sequencia de portas de knock (separadas por VIRGULA, e.g., 13,37,30000,3000): " PORTS_INPUT
-    
-    # Validação básica
-    if [[ -z "$PORTS_INPUT" ]]; then
-        log_message " Sequência de portas não pode ser vazia. Saindo."
-        exit 1
-    fi
-    
-    # Converte a string (separada por vírgula) para um array KNOCK_PORTS
-    IFS=',' read -r -a KNOCK_PORTS <<< "$PORTS_INPUT"
+# Send a single TCP packet to host:port (fire-and-forget)
+# /dev/tcp failing is expected for closed ports — that IS the knock.
+# We suppress errors deliberately here.
+knock_port() {
+    local host="$1" port="$2"
+    bash -c "(echo > /dev/tcp/${host}/${port})" 2>/dev/null || true
 }
 
-## FUNÇÃO PARA REALIZAR O KNOCKING
-function perform_knock() {
-    local host_ip=$1
-    log_message "Realizando KNOCK em $host_ip..."
+# Execute the full knock sequence against a host
+perform_knock() {
+    local host="$1"
+    local delay_sec
+    delay_sec=$(echo "scale=3; $KNOCK_DELAY/1000" | bc)
 
-    for port in "${KNOCK_PORTS[@]}"; do
-        # Tenta usar /dev/tcp nativo do Bash
-        timeout $TIMEOUT_SEC bash -c "(echo > /dev/tcp/$host_ip/$port)" &>/dev/null
-        if [ $? -ne 0 ]; then
-            log_message "  -> Knock falhou em $host_ip:$port. Parando..."
-            return 1
-        fi
-        sleep 0.1 
+    log info "  Knocking ${host}: ${KNOCK_PORTS}"
+
+    IFS=',' read -ra ports <<< "$KNOCK_PORTS"
+    for port in "${ports[@]}"; do
+        knock_port "$host" "$port"
+        sleep "$delay_sec"
     done
-    return 0
 }
 
-##  FUNÇÃO PARA VERIFICAR A PORTA ALVO
-function check_target_port() {
-    local host_ip=$1
-    log_message "Verificando se a porta $TARGET_PORT foi aberta em $host_ip..."
+# Check if target port is open using nmap (preferred) or /dev/tcp fallback
+check_port() {
+    local host="$1"
 
-    # Usa NMAP (se disponivel) para varredura confiavel
     if command -v nmap &>/dev/null; then
-        nmap_output=$(nmap -p $TARGET_PORT --open $host_ip | grep "$TARGET_PORT/tcp open")
-        if [[ $nmap_output ]]; then
-            return 0
-        else
-            return 1
-        fi
+        nmap -p "$TARGET_PORT" --open -T4 "$host" 2>/dev/null \
+            | grep -q "${TARGET_PORT}/tcp open"
+        return $?
     fi
 
-    # Se NMAP nao estiver, usa /dev/tcp nativo com timeout
-    timeout $TIMEOUT_SEC bash -c "(echo > /dev/tcp/$host_ip/$TARGET_PORT)" &>/dev/null
-    if [ $? -eq 0 ]; then
-        return 0
+    # /dev/tcp fallback
+    timeout "$TIMEOUT" bash -c \
+        "(echo > /dev/tcp/${host}/${TARGET_PORT})" 2>/dev/null
+    return $?
+}
+
+# Probe the open port for a banner (TCP, not assumed HTTP)
+grab_banner() {
+    local host="$1"
+    local banner=""
+
+    banner=$(timeout "$TIMEOUT" bash -c \
+        "echo '' | nc -w${TIMEOUT} ${host} ${TARGET_PORT} 2>/dev/null" \
+        | head -3 | tr -d '\000') || true
+
+    if [[ -z "$banner" ]] && command -v curl &>/dev/null; then
+        banner=$(curl -m "$TIMEOUT" -s "http://${host}:${TARGET_PORT}" \
+            | head -3) || true
+    fi
+
+    [[ -n "$banner" ]] && echo "$banner" || echo "(no banner)"
+}
+
+# Full test cycle for a single host
+scan_host() {
+    local host="$1"
+
+    log info "Testing ${host}..."
+    perform_knock "$host"
+
+    log info "  Waiting ${OPEN_DELAY}s for port to activate..."
+    sleep "$OPEN_DELAY"
+
+    if check_port "$host"; then
+        local banner
+        banner=$(grab_banner "$host")
+
+        log ok "SERVICE FOUND at ${host}:${TARGET_PORT}"
+        $SILENT || echo -e "  ${DG}banner:${R} ${banner}"
+
+        if [[ -n "$OUTPUT" ]]; then
+            printf "[FOUND] %s:%s | knock: %s | banner: %s\n" \
+                "$host" "$TARGET_PORT" "$KNOCK_PORTS" "$banner" >> "$OUTPUT"
+        fi
     else
-        return 1
+        log warn "  Port ${TARGET_PORT} did not open on ${host}"
     fi
 }
 
-##  INÍCIO DO SCRIPT
-clear
-log_message "Iniciando configuracao da varredura de rede."
+# ================================================================
+#  ARGUMENT PARSING
+# ================================================================
 
-# 1. CAPTURA DOS INPUTS
-get_network_input
-get_knock_ports_input
+[[ $# -eq 0 ]] && usage
 
-# 2. INFORMAÇÕES DO SCAN
-log_message "Varredura configurada para $SUBNET.0/24"
-log_message "Portas de Knocking: ${KNOCK_PORTS[*]} | Porta Alvo: $TARGET_PORT"
-echo "---"
-
-# 3. LOOP DE VARREDURA
-COUNTER=1
-for IP_OCTET in $(seq 1 254); do
-    CURRENT_IP="$SUBNET.$IP_OCTET"
-    log_message "[$COUNTER/254] Testando host $CURRENT_IP..."
-
-    if perform_knock "$CURRENT_IP"; then
-        
-        sleep 2 # Espera para a porta ser ativada
-        if check_target_port "$CURRENT_IP"; then
-            echo ""
-            echo " ==========================================================="
-            log_message "SERVIÇO ATIVADO ENCONTRADO em $CURRENT_IP:$TARGET_PORT!"
-            echo " ==========================================================="
-            
-            # Tenta pegar a pagina, se wget/curl estiverem disponiveis
-            log_message "Tentando obter resposta da porta $TARGET_PORT..."
-            if command -v wget &>/dev/null; then
-                wget -T $TIMEOUT_SEC -qO - "http://$CURRENT_IP:$TARGET_PORT"
-            elif command -v curl &>/dev/null; then
-                curl -m $TIMEOUT_SEC -s "http://$CURRENT_IP:$TARGET_PORT"
-            else
-                log_message "(Ferramentas wget ou curl não encontradas.)"
-            fi
-            
-            echo ""
-            exit 0
-        else
-            log_message "  -> Porta $TARGET_PORT não abriu após o knock."
-        fi
-    fi
-
-    echo "---"
-    ((COUNTER++))
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--target)       TARGET="$2";      shift 2 ;;
+        -k|--knock)        KNOCK_PORTS="$2"; shift 2 ;;
+        -p|--port)         TARGET_PORT="$2"; shift 2 ;;
+        -d|--knock-delay)  KNOCK_DELAY="$2"; shift 2 ;;
+        -w|--wait)         OPEN_DELAY="$2";  shift 2 ;;
+        -T|--timeout)      TIMEOUT="$2";     shift 2 ;;
+        -t2|--threads)     THREADS="$2";     shift 2 ;;
+        -o|--output)       OUTPUT="$2";      shift 2 ;;
+        --silent)          SILENT=true;      shift ;;
+        -h|--help)         usage ;;
+        *) echo -e "${RD}[!]${R} Unknown option: $1"; usage ;;
+    esac
 done
 
-log_message "Varredura completa. Nenhum serviço ativado por knock encontrado."
-exit 0
+# ── Validations ───────────────────────────────────────────────────
+
+[[ -z "$TARGET"      ]] && { echo -e "${RD}[!]${R} -t is required"; exit 1; }
+[[ -z "$KNOCK_PORTS" ]] && { echo -e "${RD}[!]${R} -k is required"; exit 1; }
+[[ -z "$TARGET_PORT" ]] && { echo -e "${RD}[!]${R} -p is required"; exit 1; }
+
+for dep in bc; do
+    command -v "$dep" &>/dev/null || { echo -e "${RD}[!]${R} missing dependency: $dep"; exit 1; }
+done
+
+# ── Determine mode: single IP or subnet ───────────────────────────
+
+# A valid single IP has 3 dots; a subnet prefix has 2
+if echo "$TARGET" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    MODE="single"
+elif echo "$TARGET" | grep -qE '^([0-9]{1,3}\.){2}[0-9]{1,3}$'; then
+    MODE="subnet"
+else
+    echo -e "${RD}[!]${R} Invalid target: use full IP (192.168.1.10) or subnet prefix (192.168.1)"
+    exit 1
+fi
+
+# ── Prepare output file ───────────────────────────────────────────
+
+if [[ -n "$OUTPUT" ]]; then
+    printf "# knockscan | target: %s | knock: %s | port: %s | %s\n\n" \
+        "$TARGET" "$KNOCK_PORTS" "$TARGET_PORT" "$(date '+%Y-%m-%d %H:%M:%S')" > "$OUTPUT"
+fi
+
+# ================================================================
+#  RUN
+# ================================================================
+
+START_TIME=$(date +%s)
+
+if [[ "$MODE" == "single" ]]; then
+
+    log info "Mode: single host | knock: ${KNOCK_PORTS} | target port: ${TARGET_PORT}"
+    echo
+    scan_host "$TARGET"
+
+else
+
+    log info "Mode: subnet ${TARGET}.0/24 | knock: ${KNOCK_PORTS} | target port: ${TARGET_PORT} | threads: ${THREADS}"
+    echo
+
+    FOUND=0
+    declare -a jobs=()
+
+    for octet in $(seq 1 254); do
+        host="${TARGET}.${octet}"
+
+        scan_host "$host" &
+        jobs+=($!)
+
+        # Thread pool control
+        while [[ ${#jobs[@]} -ge $THREADS ]]; do
+            alive=()
+            for pid in "${jobs[@]}"; do
+                kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+            done
+            jobs=("${alive[@]}")
+            [[ ${#jobs[@]} -ge $THREADS ]] && sleep 0.1
+        done
+    done
+
+    for pid in "${jobs[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+fi
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+echo
+log info "Scan complete | time: ${ELAPSED}s"
+[[ -n "$OUTPUT" ]] && log info "Saved: ${OUTPUT}"a
